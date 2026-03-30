@@ -1,0 +1,14 @@
+*.db
+data/images/
+scripts/processing/images/
+
+__pycache__/
+*.py[cod]
+
+*.db
+*.sqlite3
+
+# Environment/IDE
+.venv/
+.vscode/
+.idea/
