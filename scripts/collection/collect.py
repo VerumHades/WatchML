@@ -74,7 +74,7 @@ def create_brand_context(brand_name: str) -> Context:
     """
     Initializes the storage context for a specific brand.
     """
-    output_file = f"data/{brand_name}_listings.jsonl"
+    output_file = f"data/json/{brand_name}_listings.jsonl"
     download_path = f"data/images/{brand_name}"
     
     os.makedirs("data", exist_ok=True)

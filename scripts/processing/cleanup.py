@@ -106,7 +106,7 @@ if __name__ == "__main__":
         name = file.split(".")[0]
 
 
-        df = extract_jsonl_data(os.path.join("data", file))
+        df = extract_jsonl_data(os.path.join("data", "json", file))
 
         if result is None:
             result = df
@@ -115,4 +115,4 @@ if __name__ == "__main__":
 
 
     result = result.drop_duplicates(subset="url")
-    result.to_csv(f"processing/full.csv")
+    result.to_csv(f"data/csv/full.csv")

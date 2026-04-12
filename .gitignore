@@ -1,6 +1,7 @@
 *.db
 data/images/
 scripts/processing/images/
+models/
 
 __pycache__/
 *.py[cod]
