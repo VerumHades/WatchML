@@ -54,9 +54,10 @@ class WatchDataset(Dataset):
     """
     Bridge between the CSV labels and the physical image files.
     """
-    def __init__(self, dataframe, transform=None):
+    def __init__(self, dataframe, transform=None, tasks=None):
         self.dataframe = dataframe
         self.transform = transform
+        self.tasks = tasks or ['brand', 'core_model', 'model_variant']
         
     def __len__(self):
         return len(self.dataframe)
@@ -68,40 +69,35 @@ class WatchDataset(Dataset):
         if self.transform:
             image = self.transform(image)
             
+        # Dynamically build the labels dictionary for ALL tasks
         labels = {
-            'brand': torch.tensor(row['brand_label'], dtype=torch.long),
-            'core_model': torch.tensor(row['core_model_label'], dtype=torch.long),
-            'model_variant': torch.tensor(row['model_variant_label'], dtype=torch.long)
+            task: torch.tensor(row[f'{task}_label'], dtype=torch.long)
+            for task in self.tasks
         }
+        
         return image, labels
 
 # --- 2. ARCHITECTURE ---
 
-class MultiOutputWatchNet(nn.Module):
+class WatchMultiTaskNet(nn.Module):
     """
-    A Multi-Head CNN using a ResNet-50 backbone.
+    Dynamic Multi-Task Network for watch attribute inference.
     """
-    def __init__(self, num_brands, num_models, num_variants):
-        super(MultiOutputWatchNet, self).__init__()
-        # Load pre-trained ResNet50
+    def __init__(self, task_dimensions):
+        super().__init__()
         self.backbone = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
         input_features = self.backbone.fc.in_features
-        
-        # Replace the final fully connected layer with a dummy
         self.backbone.fc = nn.Identity()
 
-        # Define 3 distinct heads
-        self.brand_head = nn.Linear(input_features, num_brands)
-        self.model_head = nn.Linear(input_features, num_models)
-        self.variant_head = nn.Linear(input_features, num_variants)
+        # Create a head for every attribute provided in task_dimensions
+        self.heads = nn.ModuleDict({
+            task_name: nn.Linear(input_features, num_classes)
+            for task_name, num_classes in task_dimensions.items()
+        })
 
     def forward(self, x):
         features = self.backbone(x)
-        return {
-            'brand': self.brand_head(features),
-            'core_model': self.model_head(features),
-            'model_variant': self.variant_head(features)
-        }
+        return {task: head(features) for task, head in self.heads.items()}
 
 # --- 3. UTILITY FUNCTIONS ---
 
@@ -114,33 +110,26 @@ def get_transforms():
         transforms.ToTensor(),
     ])
 
+TASKS = [
+    'brand', 'core_model', 'model_variant', 
+    'bezel_material', 'case_material', 'dial'
+]
+
 def prepare_data(csv_path, image_dir):
-    """
-    Refactored data preparation using index-to-file mapping.
-    """
     df = pd.read_csv(csv_path)
-
-    if df.empty:
-        raise ValueError(f"The CSV file at {csv_path} is empty.")
-
-    # 1. Map Images using the Row Index
+    
+    # 1. Image Mapping (using the index fix from before)
     all_files = [f for f in os.listdir(image_dir) if '_image_' in f]
     file_map = {f.split('_image_')[0]: f for f in all_files}
-    
-    # We map the index to the filename, then convert to Series to use .apply()
     df['full_path'] = pd.Series(df.index.astype(str).map(file_map)).apply(
-        lambda filename: os.path.join(image_dir, filename) if pd.notnull(filename) else None
-    ).values # Use .values to ensure the Series aligns back to the DataFrame rows
+        lambda f: os.path.join(image_dir, f) if pd.notnull(f) else None
+    ).values
     
-    # 2. Filter and Validate
     df = df.dropna(subset=['full_path']).copy()
 
-    if df.empty:
-        raise ValueError("Zero images matched using the row index as ID.")
-
-    # 3. Encode Labels
+    # 2. Encode all dynamic tasks
     encoders = {}
-    for col in ['brand', 'core_model', 'model_variant']:
+    for col in TASKS:
         le = LabelEncoder()
         df[f'{col}_label'] = le.fit_transform(df[col].astype(str))
         encoders[col] = le
@@ -167,96 +156,106 @@ def save_model(model, epoch):
 
 
 def train_one_epoch(model, loader, optimizer, criterion, device, epoch):
-    """
-    Executes a training pass and tracks performance for all three watch attributes.
-    """
     model.train()
-    
-    # Initialize trackers
-    total_samples = 0
-    running_loss = 0.0
-    correct = {'brand': 0, 'core_model': 0, 'model_variant': 0}
+    running_loss, total_samples = 0.0, 0
+    # Dynamic tracking based on the heads in the model
+    correct = {task: 0 for task in model.heads.keys()}
 
     for images, labels in loader:
-        images = images.to(device)
-        optimizer.zero_grad()
+        images, targets = images.to(device), {k: v.to(device) for k, v in labels.items()}
         
-        # 1. Forward Pass
+        optimizer.zero_grad(set_to_none=True)
         outputs = model(images)
         
-        # 2. Map labels to device (Matching your specific keys)
-        targets = {k: v.to(device) for k, v in labels.items()}
+        # Calculate loss for all tasks (Weighting: Brand gets priority)
+        task_losses = {task: criterion(outputs[task], targets[task]) for task in outputs}
         
-        # 3. Multi-Head Loss Calculation
-        loss_brand = criterion(outputs['brand'], targets['brand'])
-        loss_model = criterion(outputs['core_model'], targets['core_model'])
-        loss_variant = criterion(outputs['model_variant'], targets['model_variant'])
+        # Hierarchical Weighting: Brand is the anchor
+        total_loss = (5.0 * task_losses['brand']) + sum(task_losses.values())
         
-        # 4. Backprop
-        total_loss = (1.0 * loss_brand) + (1.0 * loss_model) + (1.0 * loss_variant)
         total_loss.backward()
         optimizer.step()
 
-        # --- Statistics Collection ---
+        # Stats collection
         running_loss += total_loss.item()
         total_samples += images.size(0)
+        for task in correct:
+            _, pred = torch.max(outputs[task], 1)
+            correct[task] += (pred == targets[task]).sum().item()
 
-        for head in ['brand', 'core_model', 'model_variant']:
-            _, predicted = torch.max(outputs[head], 1)
-            correct[head] += (predicted == targets[head]).sum().item()
+    return finalize_report(running_loss, loader, correct, total_samples, epoch)
 
-    # Calculate Epoch Averages
-    avg_loss = running_loss / len(loader)
-    acc = {h: (correct[h] / total_samples) * 100 for h in correct}
-
-    # Print Dashboard
-    print(f"\n" + "="*30)
-    print(f" EPOCH STATISTICS")
-    print(f"-"*30)
-    print(f" Avg Total Loss: {avg_loss:.4f}")
-    print(f" Brand Accuracy: {acc['brand']:>6.2f}%")
-    print(f" Model Accuracy: {acc['core_model']:>6.2f}%")
-    print(f" Variant Acc:    {acc['model_variant']:>6.2f}%")
-    print("="*30 + "\n")
-
-    save_model(model, epoch)
-
+def finalize_report(loss, loader, correct, total, epoch):
+    avg_loss = loss / len(loader)
+    acc = {task: (count / total) * 100 for task, count in correct.items()}
+    
+    print(f"\n{'='*35}\n EPOCH {epoch+1} DASHBOARD\n{'-'*35}")
+    print(f" Total Loss: {avg_loss:.4f}")
+    for task, val in acc.items():
+        print(f" {task.replace('_', ' ').title():<15}: {val:>6.2f}%")
+    print(f"{'='*35}")
+    
     return avg_loss, acc
-
 # --- 5. ORCHESTRATOR ---
 
 def run_pytorch_training(csv_path, image_dir):
+    """
+    Orchestrates the full training lifecycle for multi-attribute watch inference.
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Data Prep
+    # 1. Data Preparation
+    # TASKS = ['brand', 'core_model', 'model_variant', 'bezel_material', 'case_material', 'dial']
     df, encoders = prepare_data(csv_path, image_dir)
-    train_df, val_df = train_test_split(df, test_size=0.2, random_state=42)
+    train_df, val_df = train_test_split(df, test_size=0.15, random_state=42)
     
-    # Loaders
-    train_ds = WatchDataset(train_df, transform=get_transforms())
-    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)
-    
-    # core_model Setup
-    core_model = MultiOutputWatchNet(
-        len(encoders['brand'].classes_),
-        len(encoders['core_model'].classes_),
-        len(encoders['model_variant'].classes_)
-    ).to(device)
-
-    #for param in core_model.backbone.parameters():
-    #    param.requires_grad = False
-    
-    optimizer = optim.Adam(core_model.parameters(), lr=0.0001)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=2
+    # 2. Infrastructure Setup
+    train_loader = DataLoader(
+        WatchDataset(train_df, transform=get_transforms(), tasks=TASKS), 
+        batch_size=32, 
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True
     )
+    
+    # Generate task dimensions dynamically from encoders
+    task_dims = {task: len(encoders[task].classes_) for task in TASKS}
+    
+    model = WatchMultiTaskNet(task_dims).to(device)
+    
+    # 3. Optimization Strategy
+    # We use a slightly lower LR (5e-5) because we have many heads to balance
+    optimizer = optim.Adam(model.parameters(), lr=5e-5)
     criterion = nn.CrossEntropyLoss()
     
-    # Training
-    print(f"Training on {device}...")
-    for epoch in range(20):
-        avg_loss, accuracy = train_one_epoch(core_model, train_loader, optimizer, criterion, device, epoch)
-        scheduler.step(avg_loss)
+    # Scheduler monitors 'brand' accuracy to decide when to "squeeze" the learning rate
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.5, patience=3
+    )
+
+    print(f"Starting Multi-Task Training on {len(df)} images...")
+    print(f"Inference Targets: {', '.join(TASKS)}")
+
+    # 4. Training Loop
+    for epoch in range(30):
+        avg_loss, accuracy = train_one_epoch(
+            model, train_loader, optimizer, criterion, device, epoch
+        )
+        
+        # Step the scheduler based on the Anchor Task (Brand)
+        scheduler.step(accuracy['brand'])
+        
+        # Periodic snapshot of model focus
+        if epoch % 5 == 0:
+            print(f"Epoch {epoch+1} complete. Model focus snapshot saved.")
+
+    print("Training Complete. Final model saved to run directory.")
 
 
-run_pytorch_training('data/csv/face_inference_clean.csv', 'data/images/normalized_dials')
+# THIS IS THE CRITICAL PROTECTOR FOR WINDOWS
+if __name__ == '__main__':
+    # Now it is safe to call the training function
+    run_pytorch_training(
+        csv_path='data/csv/face_inference_clean.csv', 
+        image_dir='data/images/normalized_dials'
+    )
