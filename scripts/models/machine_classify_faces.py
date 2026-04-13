@@ -8,10 +8,9 @@ from tqdm import tqdm  # Standard for progress bars
 
 # --- CONSTANTS ---
 MODEL_PATH = "watch_face_model.pth"
-SOURCE_DIR = "data/images"
-OUTPUT_ROOT = "data/machine_classified_all"
+SOURCE_DIR = "data/images/indexed"
+OUTPUT_ROOT = "data/images/machine_classified_faces"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 
 def get_inference_transforms():
     """

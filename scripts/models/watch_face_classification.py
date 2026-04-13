@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, models, transforms
 
 # --- CONSTANTS ---
-DATA_ROOT = "data/classified"
+DATA_ROOT = "data/images/classified"
 MODEL_SAVE_PATH = "watch_face_model.pth"
 BATCH_SIZE = 32
 LEARNING_RATE = 0.001
@@ -55,17 +55,22 @@ def prepare_data_loader(data_path):
 
 def build_binary_model(device):
     """
-    Modifies ResNet18 and enables CUDNN benchmark for speed.
+    Modifies ResNet18, unfreezes the final layer block for fine-tuning, 
+    and enables CUDNN benchmark.
     """
     torch.backends.cudnn.benchmark = True 
     model = models.resnet18(weights='DEFAULT')
     
+    # Freeze all layers initially
     for parameter in model.parameters():
         parameter.requires_grad = False
         
+    # Unfreeze the last residual block (layer4) to allow specialized learning
+    for parameter in model.layer4.parameters():
+        parameter.requires_grad = True
+        
     model.fc = nn.Linear(model.fc.in_features, 2)
     return model.to(device)
-
 
 def run_training_step(model, batch, optimizer, criterion, device):
     """

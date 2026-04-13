@@ -11,42 +11,6 @@ from sklearn.preprocessing import LabelEncoder
 
 import torch.nn.functional as F
 
-class VisualizationService:
-    """
-    Provides tools to inspect the model's internal attention.
-    """
-    def __init__(self, model):
-        self.model = model
-        self.gradients = None
-
-    def save_gradient(self, grad):
-        self.gradients = grad
-
-    def get_heatmap(self, image_tensor, target_head='brand'):
-        """
-        Generates a Grad-CAM heatmap for a specific output head.
-        """
-        self.model.eval()
-        # Hook into the last convolutional layer of ResNet
-        target_layer = self.model.backbone.layer4[-1]
-        handler = target_layer.register_backward_hook(lambda m, i, o: self.save_gradient(o[0]))
-        
-        # Forward pass
-        output = self.model(image_tensor.unsqueeze(0))
-        target_index = output[target_head].argmax()
-        
-        # Backward pass
-        self.model.zero_grad()
-        output[target_head][0, target_index].backward()
-        
-        # Process heatmap
-        weights = torch.mean(self.gradients, dim=(2, 3), keepdim=True)
-        heatmap = torch.mean(weights * target_layer.weight, dim=1).squeeze().detach()
-        heatmap = np.maximum(heatmap.numpy(), 0)
-        heatmap /= np.max(heatmap)
-        
-        handler.remove()
-        return heatmap
         
 # --- 1. DATASET ENGINE ---
 
@@ -120,7 +84,10 @@ def prepare_data(csv_path, image_dir):
     
     # 1. Image Mapping (using the index fix from before)
     all_files = [f for f in os.listdir(image_dir) if '_image_' in f]
+    
     file_map = {f.split('_image_')[0]: f for f in all_files}
+    #print(file_map, len(file_map))
+
     df['full_path'] = pd.Series(df.index.astype(str).map(file_map)).apply(
         lambda f: os.path.join(image_dir, f) if pd.notnull(f) else None
     ).values
@@ -182,6 +149,8 @@ def train_one_epoch(model, loader, optimizer, criterion, device, epoch):
         for task in correct:
             _, pred = torch.max(outputs[task], 1)
             correct[task] += (pred == targets[task]).sum().item()
+
+    save_model(model, epoch)
 
     return finalize_report(running_loss, loader, correct, total_samples, epoch)
 
@@ -256,6 +225,6 @@ def run_pytorch_training(csv_path, image_dir):
 if __name__ == '__main__':
     # Now it is safe to call the training function
     run_pytorch_training(
-        csv_path='data/csv/face_inference_clean.csv', 
-        image_dir='data/images/normalized_dials'
+        csv_path='data/csv/full_clean.csv', 
+        image_dir='data/images/normalized_dials_full'
     )
