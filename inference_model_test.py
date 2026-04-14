@@ -258,7 +258,7 @@ def launch_application():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     dataframe, encoders = prepare_data(
-        csv_path="data/csv/face_inference_clean.csv",
+        csv_path="data/csv/full_clean.csv",
         image_dir="data/images/normalized_dials_full"
     )
 

@@ -141,8 +141,12 @@ class WatchHierarchicalNet(nn.Module):
         # Generate attribute logits
         attribute_logits = {task: head(visual_emb) for task, head in self.heads.items()}
         
-        # Concatenate logits for price inference
-        price_input = torch.cat([logits for logits in attribute_logits.values()], dim=1)
+        probabilities = [
+            torch.softmax(logits, dim=1)
+            for logits in attribute_logits.values()
+        ]
+
+        price_input = torch.cat(probabilities, dim=1)
         price_prediction = self.price_head(price_input)
         
         return attribute_logits, price_prediction
@@ -189,7 +193,10 @@ def train_one_epoch(model, loader, optimizer, criteria, device, epoch):
         optimizer.zero_grad(set_to_none=True)
         attr_out, price_out = model(images)
         
-        clf_loss = sum(criteria['clf'](attr_out[t], targets[t]) for t in attr_out)
+        clf_loss = sum(
+            criteria['clf'][task](attr_out[task], targets[task])
+            for task in attr_out
+        )
         reg_loss = criteria['reg'](price_out, prices)
         
         (clf_loss + reg_loss).backward()
@@ -226,10 +233,28 @@ def finalize_report(loss, loader, correct, total, epoch, running_mse):
     for task, val in acc.items():
         display_name = task.replace('_', ' ').title()
         print(f" {display_name:<15}: {val:>6.2f}%")
+
     print(f"{'='*40}")
     
     return avg_loss, acc
 
+def compute_class_weights(dataframe, tasks):
+    """
+    Computes inverse-frequency class weights for each task.
+    """
+    task_class_weights = {}
+
+    for task in tasks:
+        label_column = f"{task}_label"
+        class_counts = dataframe[label_column].value_counts().sort_index().values
+        total_samples = np.sum(class_counts)
+
+        weights = total_samples / (len(class_counts) * class_counts)
+        normalized_weights = weights / weights.sum() * len(class_counts)
+
+        task_class_weights[task] = torch.tensor(normalized_weights, dtype=torch.float32)
+
+    return task_class_weights
 # --- 5. MAIN ---
 
 def run_pytorch_training(csv_path, image_dir):
@@ -251,11 +276,20 @@ def run_pytorch_training(csv_path, image_dir):
     model = WatchHierarchicalNet(task_dims).to(device)
     
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
-    criteria = {'clf': nn.CrossEntropyLoss(), 'reg': nn.MSELoss()}
+    class_weights = compute_class_weights(train_df, tasks)
+    class_weights = {task: weights.to(device) for task, weights in class_weights.items()}
+
+    criteria = {
+        'clf': {
+            task: nn.CrossEntropyLoss(weight=class_weights[task])
+            for task in tasks
+        },
+        'reg': nn.MSELoss()
+    }
 
     print(f"Starting Hierarchical Training on {len(train_df)} images...")
     for epoch in range(30):
         train_one_epoch(model, loader, optimizer, criteria, device, epoch)
 
 if __name__ == '__main__':
-    run_pytorch_training('data/csv/face_inference_clean.csv', 'data/images/normalized_dials_full')
+    run_pytorch_training('data/csv/full_clean.csv', 'data/images/normalized_dials_full')
